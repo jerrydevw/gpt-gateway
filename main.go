@@ -18,6 +18,8 @@ var (
 	apiKey     = os.Getenv("OPENAI_API_KEY")
 	apiOrg     = os.Getenv("OPENAI_ORGANIZATION")
 	apiProject = os.Getenv("OPENAI_PROJECT")
+
+	serviceAPIKey = os.Getenv("SERVICE_API_KEY")
 )
 
 type GenerateRequest struct {
@@ -50,23 +52,53 @@ type OpenAIResponse struct {
 }
 
 func main() {
+	// Valida se a sua chave de API foi definida
+	if serviceAPIKey == "" {
+		log.Fatal("Variável de ambiente 'SERVICE_API_KEY' não definida.")
+	}
+
 	db, err := sql.Open("sqlite3", "./data.db")
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	// Tabela única
 	db.Exec(`CREATE TABLE IF NOT EXISTS entries (
-		device_name TEXT PRIMARY KEY,
-		keyword TEXT,
-		language TEXT,
-		prompt TEXT,
-		output TEXT
-	)`)
+       device_name TEXT PRIMARY KEY,
+       keyword TEXT,
+       language TEXT,
+       prompt TEXT,
+       output TEXT
+    )`)
 
-	// 1️⃣ /generate → gera/atualiza código usando ChatGPT
-	http.HandleFunc("/generate", func(w http.ResponseWriter, r *http.Request) {
+	// Protege os handlers com o middleware
+	http.Handle("/generate", authMiddleware(http.HandlerFunc(generateHandler(db))))
+	http.Handle("/code", authMiddleware(http.HandlerFunc(codeHandler(db))))
+
+	fmt.Println("Servidor rodando em http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+// authMiddleware é uma função que envolve seus handlers para adicionar autenticação
+func authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Pega o valor do cabeçalho 'X-API-Key'
+		key := r.Header.Get("X-API-Key")
+
+		// Se a chave não corresponder, retorna um erro de não autorizado
+		if key != serviceAPIKey {
+			http.Error(w, "Chave de API inválida", http.StatusUnauthorized)
+			return
+		}
+
+		// Se a chave for válida, continua a execução para o próximo handler
+		next.ServeHTTP(w, r)
+	})
+}
+
+// 1️⃣ /generate → gera/atualiza código usando ChatGPT
+func generateHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
 			return
@@ -87,7 +119,6 @@ func main() {
 		err := db.QueryRow("SELECT output FROM entries WHERE device_name = ?", req.DeviceName).Scan(&output)
 
 		if err == sql.ErrNoRows || req.Refresh {
-			// chama OpenAI
 			fmt.Println("Chamando API ChatGPT...")
 			output, err = callOpenAI(req.Prompt)
 			if err != nil {
@@ -95,13 +126,12 @@ func main() {
 				return
 			}
 
-			// persiste no banco (insert/update)
 			_, err = db.Exec(`
-				INSERT INTO entries(device_name, keyword, language, prompt, output)
-				VALUES(?, ?, ?, ?, ?)
-				ON CONFLICT(device_name) DO UPDATE 
-				SET keyword=excluded.keyword, language=excluded.language, prompt=excluded.prompt, output=excluded.output
-			`, req.DeviceName, req.Keyword, req.Language, req.Prompt, output)
+             INSERT INTO entries(device_name, keyword, language, prompt, output)
+             VALUES(?, ?, ?, ?, ?)
+             ON CONFLICT(device_name) DO UPDATE 
+             SET keyword=excluded.keyword, language=excluded.language, prompt=excluded.prompt, output=excluded.output
+          `, req.DeviceName, req.Keyword, req.Language, req.Prompt, output)
 			if err != nil {
 				http.Error(w, "Erro ao salvar no banco", http.StatusInternalServerError)
 				return
@@ -117,10 +147,12 @@ func main() {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	})
+	}
+}
 
-	// 2️⃣ /code → busca código salvo para um device
-	http.HandleFunc("/code", func(w http.ResponseWriter, r *http.Request) {
+// 2️⃣ /code → busca código salvo para um device
+func codeHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		device := r.URL.Query().Get("device")
 		if device == "" {
 			http.Error(w, "device é obrigatório", http.StatusBadRequest)
@@ -138,10 +170,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(resp)
-	})
-
-	fmt.Println("Servidor rodando em http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	}
 }
 
 // --- Integração com ChatGPT ---
@@ -176,6 +205,5 @@ func callOpenAI(prompt string) (string, error) {
 		}
 	}
 
-	// fallback → retorna JSON cru se parsing falhar
 	return string(b), nil
 }
