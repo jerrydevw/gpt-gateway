@@ -153,6 +153,7 @@ func generateHandler(db *sql.DB) http.HandlerFunc {
 // 2️⃣ /code → busca código salvo para um device
 func codeHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("buscando dados do banco de dados...")
 		device := r.URL.Query().Get("device")
 		if device == "" {
 			http.Error(w, "device é obrigatório", http.StatusBadRequest)
