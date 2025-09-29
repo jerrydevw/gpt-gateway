@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -62,6 +63,7 @@ func main() {
 
 	http.Handle("/generate", authMiddleware(http.HandlerFunc(generateHandler)))
 	http.Handle("/code", authMiddleware(http.HandlerFunc(codeHandler)))
+	http.Handle("/keepalive", authMiddleware(http.HandlerFunc(keepAliveHandler)))
 
 	fmt.Println("Servidor rodando em http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
@@ -128,6 +130,7 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 
 // 2️⃣ /code → busca código salvo
 func codeHandler(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("buscando dados para o device")
 	device := r.URL.Query().Get("device")
 	if device == "" {
 		http.Error(w, "device é obrigatório", http.StatusBadRequest)
@@ -145,6 +148,17 @@ func codeHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(entry)
+}
+
+// 3️⃣ /keepalive → apenas confirma que a API está viva
+func keepAliveHandler(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]string{
+		"status":    "ok",
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // --- Integração com OpenAI ---
