@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,18 +9,17 @@ import (
 	"net/http"
 	"os"
 	"strings"
-
-	_ "github.com/mattn/go-sqlite3"
+	"sync"
 )
 
 var (
-	apiKey     = os.Getenv("OPENAI_API_KEY")
-	apiOrg     = os.Getenv("OPENAI_ORGANIZATION")
-	apiProject = os.Getenv("OPENAI_PROJECT")
-
+	apiKey        = os.Getenv("OPENAI_API_KEY")
+	apiOrg        = os.Getenv("OPENAI_ORGANIZATION")
+	apiProject    = os.Getenv("OPENAI_PROJECT")
 	serviceAPIKey = os.Getenv("SERVICE_API_KEY")
 )
 
+// Estruturas
 type GenerateRequest struct {
 	DeviceName string `json:"device_name"`
 	Keyword    string `json:"keyword"`
@@ -51,130 +49,105 @@ type OpenAIResponse struct {
 	} `json:"output"`
 }
 
+// Banco em memória
+var (
+	mu    sync.RWMutex
+	store = make(map[string]CodeResponse)
+)
+
 func main() {
-	// Valida se a sua chave de API foi definida
 	if serviceAPIKey == "" {
 		log.Fatal("Variável de ambiente 'SERVICE_API_KEY' não definida.")
 	}
 
-	db, err := sql.Open("sqlite3", "./data.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	db.Exec(`CREATE TABLE IF NOT EXISTS entries (
-       device_name TEXT PRIMARY KEY,
-       keyword TEXT,
-       language TEXT,
-       prompt TEXT,
-       output TEXT
-    )`)
-
-	// Protege os handlers com o middleware
-	http.Handle("/generate", authMiddleware(http.HandlerFunc(generateHandler(db))))
-	http.Handle("/code", authMiddleware(http.HandlerFunc(codeHandler(db))))
+	http.Handle("/generate", authMiddleware(http.HandlerFunc(generateHandler)))
+	http.Handle("/code", authMiddleware(http.HandlerFunc(codeHandler)))
 
 	fmt.Println("Servidor rodando em http://localhost:8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// authMiddleware é uma função que envolve seus handlers para adicionar autenticação
+// Middleware de autenticação
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Pega o valor do cabeçalho 'X-API-Key'
 		key := r.Header.Get("X-API-Key")
-
-		// Se a chave não corresponder, retorna um erro de não autorizado
 		if key != serviceAPIKey {
 			http.Error(w, "Chave de API inválida", http.StatusUnauthorized)
 			return
 		}
-
-		// Se a chave for válida, continua a execução para o próximo handler
 		next.ServeHTTP(w, r)
 	})
 }
 
-// 1️⃣ /generate → gera/atualiza código usando ChatGPT
-func generateHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+// 1️⃣ /generate → gera/atualiza código
+func generateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Método não permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req GenerateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "JSON inválido", http.StatusBadRequest)
+		return
+	}
+
+	if req.DeviceName == "" || req.Keyword == "" || req.Language == "" || req.Prompt == "" {
+		http.Error(w, "device_name, keyword, language e prompt são obrigatórios", http.StatusBadRequest)
+		return
+	}
+
+	mu.RLock()
+	entry, exists := store[req.DeviceName]
+	mu.RUnlock()
+
+	if !exists || req.Refresh {
+		fmt.Println("Chamando API ChatGPT...")
+		output, err := callOpenAI(req.Prompt)
+		if err != nil {
+			http.Error(w, "Erro OpenAI: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		var req GenerateRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, "JSON inválido", http.StatusBadRequest)
-			return
-		}
-
-		if req.DeviceName == "" || req.Keyword == "" || req.Language == "" || req.Prompt == "" {
-			http.Error(w, "device_name, keyword, language e prompt são obrigatórios", http.StatusBadRequest)
-			return
-		}
-
-		var output string
-		err := db.QueryRow("SELECT output FROM entries WHERE device_name = ?", req.DeviceName).Scan(&output)
-
-		if err == sql.ErrNoRows || req.Refresh {
-			fmt.Println("Chamando API ChatGPT...")
-			output, err = callOpenAI(req.Prompt)
-			if err != nil {
-				http.Error(w, "Erro OpenAI: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			_, err = db.Exec(`
-             INSERT INTO entries(device_name, keyword, language, prompt, output)
-             VALUES(?, ?, ?, ?, ?)
-             ON CONFLICT(device_name) DO UPDATE 
-             SET keyword=excluded.keyword, language=excluded.language, prompt=excluded.prompt, output=excluded.output
-          `, req.DeviceName, req.Keyword, req.Language, req.Prompt, output)
-			if err != nil {
-				http.Error(w, "Erro ao salvar no banco", http.StatusInternalServerError)
-				return
-			}
-		}
-
-		resp := CodeResponse{
+		entry = CodeResponse{
 			DeviceName: req.DeviceName,
 			Keyword:    req.Keyword,
 			Language:   req.Language,
 			Prompt:     req.Prompt,
 			Output:     output,
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+
+		mu.Lock()
+		store[req.DeviceName] = entry
+		mu.Unlock()
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entry)
 }
 
-// 2️⃣ /code → busca código salvo para um device
-func codeHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		fmt.Println("buscando dados do banco de dados...")
-		device := r.URL.Query().Get("device")
-		if device == "" {
-			http.Error(w, "device é obrigatório", http.StatusBadRequest)
-			return
-		}
-
-		var resp CodeResponse
-		err := db.QueryRow("SELECT device_name, keyword, language, prompt, output FROM entries WHERE device_name = ?", device).
-			Scan(&resp.DeviceName, &resp.Keyword, &resp.Language, &resp.Prompt, &resp.Output)
-
-		if err != nil {
-			http.Error(w, "device não encontrado", http.StatusNotFound)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+// 2️⃣ /code → busca código salvo
+func codeHandler(w http.ResponseWriter, r *http.Request) {
+	device := r.URL.Query().Get("device")
+	if device == "" {
+		http.Error(w, "device é obrigatório", http.StatusBadRequest)
+		return
 	}
+
+	mu.RLock()
+	entry, exists := store[device]
+	mu.RUnlock()
+
+	if !exists {
+		http.Error(w, "device não encontrado", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entry)
 }
 
-// --- Integração com ChatGPT ---
+// --- Integração com OpenAI ---
 func callOpenAI(prompt string) (string, error) {
 	reqBody := OpenAIRequest{Model: "o4-mini", Input: prompt}
 	bodyBytes, _ := json.Marshal(reqBody)
@@ -201,8 +174,8 @@ func callOpenAI(prompt string) (string, error) {
 
 	var oaResp OpenAIResponse
 	if err := json.Unmarshal(b, &oaResp); err == nil {
-		if len(oaResp.Output) > 0 && len(oaResp.Output[1].Content) > 0 {
-			return strings.TrimSpace(oaResp.Output[1].Content[0].Text), nil
+		if len(oaResp.Output) > 0 && len(oaResp.Output[0].Content) > 0 {
+			return strings.TrimSpace(oaResp.Output[0].Content[0].Text), nil
 		}
 	}
 
